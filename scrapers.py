@@ -134,56 +134,56 @@ EGLE_SHOP = 'https://www.grupoegle.cl/shop/'
 CRUPLAS_CATALOG = 'https://tienda.cruplas.cl/catalogo'
 
 async def collect_egle():
-    """Recorre la tienda y categorías enlazadas. Excluye precios de variantes ambiguas."""
-    from urllib.parse import urlparse
+    """Consulta categorías WooCommerce reales; solo guarda precios únicos verificables."""
+    bases = [
+        'https://www.grupoegle.cl/categoria-producto/hogar-y-retail/',
+        'https://www.grupoegle.cl/categoria-producto/detergentes-industriales/',
+    ]
     found = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         try:
             page = await browser.new_page(locale='es-CL')
-            await page.goto(EGLE_SHOP, wait_until='domcontentloaded', timeout=60000)
-            links = await page.locator('a[href]').evaluate_all("""els => els.map(a => ({
-                url:a.href, text:(a.innerText||'').trim()
-            }))""")
-            categories = []
-            for item in links:
-                u = item['url'].split('#')[0]
-                t = item['text'].lower()
-                if urlparse(u).netloc not in ('www.grupoegle.cl','grupoegle.cl'):
-                    continue
-                if any(x in u.lower() for x in ('product-category','categoria-producto')) or any(x in t for x in ('industriales','hogar y retail')):
-                    if u not in categories: categories.append(u)
-            print(f'Egle: {len(categories)} categorias candidatas', flush=True)
-            for base in [EGLE_SHOP] + categories[:35]:
-                for number in range(1, 8):
-                    u = base.rstrip('/') + ('/' if number == 1 else f'/page/{number}/')
+            for base in bases:
+                for number in range(1, 16):
+                    url = base if number == 1 else base.rstrip('/') + f'/page/{number}/'
                     try:
-                        response = await page.goto(u, wait_until='domcontentloaded', timeout=45000)
-                        if response and response.status >= 400: break
-                        cards = await page.locator('li.product, .products .product').evaluate_all("""els => els.map(el => ({
-                            name:(el.querySelector('.woocommerce-loop-product__title,h2,h3')?.textContent||'').trim(),
-                            url:el.querySelector('a[href]')?.href||'',
-                            price:(el.querySelector('.price')?.innerText||'').trim(),
-                            variable:!!el.querySelector('.product_type_variable'),
-                            soldOut:el.classList.contains('outofstock')
-                        }))""")
-                        before = len(found)
+                        response = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                        if response and response.status >= 400:
+                            break
+                        await page.wait_for_timeout(1200)
+                        cards = await page.locator('li.product, .products .product').evaluate_all("""els => els.map(el => {
+                            const a=el.querySelector('a.woocommerce-LoopProduct-link, a[href]');
+                            const name=el.querySelector('.woocommerce-loop-product__title, h2, h3');
+                            const price=el.querySelector('.price');
+                            return {name:(name?.textContent||'').trim(),url:a?.href||'',
+                              price:(price?.innerText||price?.textContent||'').trim(),
+                              variable:!!el.querySelector('.product_type_variable')};
+                        })""")
+                        print(f'Egle: {url} -> {len(cards)} tarjetas', flush=True)
+                        if not cards:
+                            break
+                        urls_before = set(found)
                         for card in cards:
-                            prices = re.findall(r'\$\s*[\d.]+(?:,\d{1,2})?',card['price'])
-                            if not card['name'] or not card['url'] or not prices or card['variable'] or card['soldOut']:
+                            if not card['name'] or not card['url'] or card['variable']:
                                 continue
-                            if '–' in card['price'] or ' - ' in card['price'] or len(prices)>2:
+                            matches = re.findall(r'\$\s*[\d.]+(?:,\d{1,2})?', card['price'])
+                            if not matches:
                                 continue
-                            value=price_clp(prices[-1])
-                            if value and value>0:
-                                found[card['url']] = {'name':card['name'],'url':card['url'],
-                                    'price':value,'vat_status':'IVA por confirmar (Egle)'}
-                        if number>1 and len(found)==before: break
+                            # Rangos o precios ambiguos se excluyen; no asignar un costo ficticio.
+                            if len(matches) > 2 or '–' in card['price'] or ' - ' in card['price']:
+                                continue
+                            price = price_clp(matches[-1])
+                            if price and price > 0:
+                                found[card['url']] = {'name':card['name'], 'url':card['url'],
+                                    'price':price, 'vat_status':'IVA por confirmar (Egle)'}
+                        if number > 1 and set(found) == urls_before:
+                            break
                     except Exception as exc:
-                        print(f'Egle: aviso en {u}: {str(exc)[:100]}',flush=True)
+                        print(f'Egle: aviso en {url}: {str(exc)[:160]}', flush=True)
                         break
             if not found:
-                raise RuntimeError(f'Egle: sin precios simples verificables; categorias candidatas={len(categories)}. Revisar variantes o rutas de categorias')
+                raise RuntimeError('Egle: categorías reales consultadas, pero sin precios simples verificables; revisar fichas de variantes')
             return list(found.values())
         finally:
             await browser.close()
@@ -202,7 +202,13 @@ async def collect_cruplas():
                 if response and response.status>=400:
                     if number>1: break
                     raise RuntimeError(f'Cruplas HTTP {response.status}')
-                await page.locator('a[href*="/producto/"]').first.wait_for(state='attached',timeout=30000)
+                try:
+                    await page.locator('a[href*="/producto/"]').first.wait_for(state='attached', timeout=12000)
+                except Exception:
+                    if number > 1 and found:
+                        print(f'Cruplas: fin de paginacion en pagina {number}', flush=True)
+                        break
+                    raise RuntimeError(f'Cruplas: sin tarjetas de productos en {url}')
                 cards=await page.locator('a[href*="/producto/"]').evaluate_all("""els => els.map(a => {
                     let node=a, chosen=a;
                     for(let i=0;i<6&&node;i++,node=node.parentElement){
