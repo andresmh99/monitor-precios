@@ -47,7 +47,84 @@ async def collect_disprolim():
             return list(seen.values())
         finally: await browser.close()
 
+
 async def collect_purity():
-    # Deliberately fail closed: site-specific parser not yet validated.
-    # Prevents silently inventing updates or confusing retail and case prices.
-    raise NotImplementedError('Extractor de Purity pendiente de validar: usar importación inicial y configurar selectores antes de activarlo.')
+    url = "https://purity.cl/todos-los-productos/?resultsPerPage=99999"
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox"]
+        )
+
+        try:
+            page = await browser.new_page(locale="es-CL")
+
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+
+            if response and response.status >= 400:
+                raise RuntimeError(f"Purity HTTP {response.status}")
+
+            selector = ".js-product-miniature, .product-miniature"
+
+            await page.locator(selector).first.wait_for(
+                timeout=30000
+            )
+
+            cards = await page.locator(selector).evaluate_all(
+                """elements => elements.map(el => {
+                    const title = el.querySelector(
+                        '.product-title a, h2 a, h3 a'
+                    );
+
+                    return {
+                        name: (title?.textContent || '').trim(),
+                        url: title?.href || '',
+                        text: (el.innerText || '').trim()
+                    };
+                })"""
+            )
+
+            productos = {}
+
+            for card in cards:
+                name = card["name"]
+                product_url = card["url"]
+
+                if not name or not product_url:
+                    continue
+
+                precios = re.findall(
+                    r"\$\s*[\d.]+(?:,\d{1,2})?",
+                    card["text"]
+                )
+
+                if not precios:
+                    continue
+
+                unitario = price_clp(precios[0])
+
+                if unitario is None or unitario <= 0:
+                    continue
+
+                productos[product_url] = {
+                    "name": name,
+                    "url": product_url,
+                    "price": unitario,
+                    "vat_status": "IVA por confirmar"
+                }
+
+            if len(productos) < 30:
+                raise RuntimeError(
+                    f"Extraccion Purity incompleta: "
+                    f"{len(productos)} productos"
+                )
+
+            return list(productos.values())
+
+        finally:
+            await browser.close()
