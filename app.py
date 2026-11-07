@@ -16,7 +16,7 @@ except FileNotFoundError:
 from db import connect, init, run
 from comparador import construir_comparaciones
 
-st.title('Monitor de precios · Purity y Disprolim')
+st.title('Andigo · Inteligencia comercial y precios')
 st.caption('Precios publicados en CLP · Capturas históricas · Comparaciones orientativas')
 
 if not os.getenv('DATABASE_URL', '').startswith(('postgresql://', 'postgres://')):
@@ -73,8 +73,8 @@ change['pct'] = ((change['last'] - change['first']) / change['first'] * 100).whe
 )
 filtered = filtered.merge(change[['product_id', 'pct']], on='product_id', how='left')
 
-catalogo, comparador, historial, estado = st.tabs([
-    '📦 Catálogo', '⚖️ Comparador', '📈 Historial', '🛠️ Ejecuciones'
+catalogo, comparador, historial, estado, rentabilidad = st.tabs([
+    '📦 Catálogo', '⚖️ Comparador', '📈 Historial', '🛠️ Ejecuciones', '💰 Rentabilidad'
 ])
 
 with catalogo:
@@ -155,3 +155,53 @@ with estado:
     else:
         st.dataframe(runs[['provider', 'checked_at', 'status', 'products_found', 'details']].head(50),
                      use_container_width=True, hide_index=True)
+
+
+with rentabilidad:
+    st.subheader('Rentabilidad objetivo: margen bruto mínimo 30 %')
+    st.caption('Simulación por unidad de venta. Compara únicamente productos equivalentes y el mismo formato de embalaje.')
+    comp = view[view['provider'] == 'Disprolim'].sort_values('name')
+    wholesale = view[view['provider'] != 'Disprolim'].sort_values(['provider','name'])
+    if comp.empty or wholesale.empty:
+        st.info('Se requieren productos de Disprolim y al menos un mayorista.')
+    else:
+        competitor_id = st.selectbox('Producto de Disprolim (referencia de venta)', comp['id'].tolist(),
+            format_func=lambda x: comp.loc[comp['id'] == x, 'name'].iloc[0], key='rent_comp')
+        supplier_id = st.selectbox('Producto del proveedor (selección manual)', wholesale['id'].tolist(),
+            format_func=lambda x: (wholesale.loc[wholesale['id'] == x, 'provider'].iloc[0] + ' · ' +
+                                   wholesale.loc[wholesale['id'] == x, 'name'].iloc[0]), key='rent_supplier')
+        competitor_row = comp.loc[comp['id'] == competitor_id].iloc[0]
+        supplier_row = wholesale.loc[wholesale['id'] == supplier_id].iloc[0]
+        st.warning('Seleccionar dos productos NO confirma equivalencia. Verifica concentración, tamaño, pack y calidad.')
+        a,b,c = st.columns(3)
+        with a:
+            discount = st.slider('Vender % más barato que Disprolim', 0, 15, 3, key='rent_discount')
+        with b:
+            other_cost = st.number_input('Otros costos variables netos ($)', min_value=0.0, value=0.0, step=100.0)
+        with c:
+            pack_units = st.number_input('Unidades vendibles por embalaje comprado', min_value=1, value=1, step=1)
+        iva = st.radio('¿Cómo está publicado el precio del proveedor?',
+            ['Neto, sin IVA', 'IVA incluido', 'Desconocido: no calcular margen'],
+            index=0 if 'IVA excluido' in str(supplier_row['vat_status']) else 2)
+        comp_iva = st.checkbox('El precio de Disprolim incluye IVA (19 %)', value=True)
+        equivalent = st.checkbox('Confirmé manualmente que ambos productos son equivalentes en calidad, presentación y cantidad', value=False)
+        published = float(supplier_row['price_clp'])
+        net_cost = published / (1.19 if iva == 'IVA incluido' else 1) / pack_units
+        comp_price = float(competitor_row['price_clp'])
+        sale_gross = comp_price * (1-discount/100)
+        sale_net = sale_gross / (1.19 if comp_iva else 1)
+        margin = (sale_net - net_cost - other_cost) / sale_net * 100 if sale_net > 0 else float('nan')
+        max_cost = sale_net * 0.70 - other_cost
+        st.caption(f'Proveedor: {supplier_row["provider"]} · Precio publicado por embalaje: ${published:,.0f} · Estado IVA: {supplier_row["vat_status"]}')
+        if iva.startswith('Desconocido') or not equivalent:
+            st.info('Pendiente de validar IVA o equivalencia. No se emite recomendación de rentabilidad.')
+        else:
+            x,y,z = st.columns(3)
+            x.metric('Precio de venta estimado', f'${sale_gross:,.0f}')
+            y.metric('Margen bruto estimado', f'{margin:.1f}%')
+            z.metric('Costo máximo neto/unidad para 30 %', f'${max_cost:,.0f}')
+            if margin >= 30:
+                st.success('Alcanza el margen bruto mínimo del 30 % bajo los supuestos ingresados.')
+            else:
+                st.error('No alcanza el margen bruto mínimo del 30 % bajo los supuestos ingresados.')
+        st.caption('Supuestos: venta afecta a IVA 19 %, compra con crédito fiscal recuperable, y costos variables netos. No incluye costos fijos ni impuestos sobre utilidades. No guarda equivalencias confirmadas.')

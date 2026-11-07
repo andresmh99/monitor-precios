@@ -5,7 +5,7 @@ import smtplib
 from email.message import EmailMessage
 
 from db import init, save, record_run, connect, PG
-from scrapers import collect_disprolim, collect_purity
+from scrapers import collect_disprolim, collect_purity, collect_egle, collect_cruplas
 
 
 def diagnosticar_base_datos():
@@ -187,7 +187,9 @@ async def main():
             "Purity",
             collect_purity,
             int(os.getenv("MIN_PURITY_PRODUCTS", "30"))
-        )
+        ),
+        ("Grupo Egle", collect_egle, int(os.getenv("MIN_EGLE_PRODUCTS", "1"))),
+        ("Cruplas", collect_cruplas, int(os.getenv("MIN_CRUPLAS_PRODUCTS", "1")))
     ]
 
     for provider, scraper, minimum in providers:
