@@ -129,99 +129,107 @@ async def collect_purity():
         finally:
             await browser.close()
 
-# NUEVOS PROVEEDORES. Se excluyen productos sin precio inequívoco.
+# Nuevos proveedores. No se infieren unidades por embalaje.
 EGLE_SHOP = 'https://www.grupoegle.cl/shop/'
 CRUPLAS_CATALOG = 'https://tienda.cruplas.cl/catalogo'
 
 async def collect_egle():
-    """WooCommerce: solo artículos simples con precio inequívoco; no confundir
-    el precio 'desde' de productos variables con un SKU comprable."""
-    from urllib.parse import urljoin
+    """Recorre la tienda y categorías enlazadas. Excluye precios de variantes ambiguas."""
+    from urllib.parse import urlparse
     found = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         try:
             page = await browser.new_page(locale='es-CL')
-            for number in range(1, 51):
-                url = EGLE_SHOP if number == 1 else urljoin(EGLE_SHOP, f'page/{number}/')
-                response = await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                if response and response.status == 404:
-                    break
-                if response and response.status >= 400:
-                    raise RuntimeError(f'Egle HTTP {response.status} en {url}')
-                cards = await page.locator('li.product').evaluate_all('''els => els.map(el => {
-                    const a = el.querySelector('a.woocommerce-LoopProduct-link, a.woocommerce-loop-product__link, a[href*="/producto/"]');
-                    const title = el.querySelector('.woocommerce-loop-product__title, h2');
-                    const price = el.querySelector('.price');
-                    const variable = !!el.querySelector('a.product_type_variable, a[href*="attribute_"]');
-                    const soldOut = !!el.querySelector('.outofstock');
-                    return {name: title?.textContent?.trim() || '', url: a?.href || '',
-                        price: price?.innerText || '', variable, soldOut};
-                })''')
-                if not cards:
-                    if number == 1:
-                        raise RuntimeError('Egle: no se encontraron tarjetas WooCommerce')
-                    break
-                before = len(found)
-                for card in cards:
-                    if card['variable'] or card['soldOut'] or not card['name'] or not card['url']:
-                        continue
-                    # El precio de oferta es el último precio visible (precio anterior tachado primero).
-                    values = re.findall(r'\$\s*[\d.]+(?:,\d{1,2})?', card['price'])
-                    if not values:
-                        continue
-                    price = price_clp(values[-1])
-                    if price and price > 0:
-                        found[card['url']] = dict(name=card['name'], url=card['url'],
-                            price=price, vat_status='IVA por confirmar (Egle)')
-                if number > 1 and len(found) == before:
-                    # Una página repetida puede significar que el sitio redirige páginas inexistentes.
-                    break
+            await page.goto(EGLE_SHOP, wait_until='domcontentloaded', timeout=60000)
+            links = await page.locator('a[href]').evaluate_all("""els => els.map(a => ({
+                url:a.href, text:(a.innerText||'').trim()
+            }))""")
+            categories = []
+            for item in links:
+                u = item['url'].split('#')[0]
+                t = item['text'].lower()
+                if urlparse(u).netloc not in ('www.grupoegle.cl','grupoegle.cl'):
+                    continue
+                if any(x in u.lower() for x in ('product-category','categoria-producto')) or any(x in t for x in ('industriales','hogar y retail')):
+                    if u not in categories: categories.append(u)
+            print(f'Egle: {len(categories)} categorias candidatas', flush=True)
+            for base in [EGLE_SHOP] + categories[:35]:
+                for number in range(1, 8):
+                    u = base.rstrip('/') + ('/' if number == 1 else f'/page/{number}/')
+                    try:
+                        response = await page.goto(u, wait_until='domcontentloaded', timeout=45000)
+                        if response and response.status >= 400: break
+                        cards = await page.locator('li.product, .products .product').evaluate_all("""els => els.map(el => ({
+                            name:(el.querySelector('.woocommerce-loop-product__title,h2,h3')?.textContent||'').trim(),
+                            url:el.querySelector('a[href]')?.href||'',
+                            price:(el.querySelector('.price')?.innerText||'').trim(),
+                            variable:!!el.querySelector('.product_type_variable'),
+                            soldOut:el.classList.contains('outofstock')
+                        }))""")
+                        before = len(found)
+                        for card in cards:
+                            prices = re.findall(r'\$\s*[\d.]+(?:,\d{1,2})?',card['price'])
+                            if not card['name'] or not card['url'] or not prices or card['variable'] or card['soldOut']:
+                                continue
+                            if '–' in card['price'] or ' - ' in card['price'] or len(prices)>2:
+                                continue
+                            value=price_clp(prices[-1])
+                            if value and value>0:
+                                found[card['url']] = {'name':card['name'],'url':card['url'],
+                                    'price':value,'vat_status':'IVA por confirmar (Egle)'}
+                        if number>1 and len(found)==before: break
+                    except Exception as exc:
+                        print(f'Egle: aviso en {u}: {str(exc)[:100]}',flush=True)
+                        break
             if not found:
-                raise RuntimeError('Egle: no se encontraron productos simples con precio')
+                raise RuntimeError(f'Egle: sin precios simples verificables; categorias candidatas={len(categories)}. Revisar variantes o rutas de categorias')
             return list(found.values())
         finally:
             await browser.close()
 
 async def collect_cruplas():
-    """Cruplas: precio publicado neto por embalaje. No dividir por unidades sin
-    leer el detalle específico de cada producto."""
-    from urllib.parse import urljoin
+    """Precio publicado neto por embalaje; no supone unidades por paquete."""
     found = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         try:
             page = await browser.new_page(locale='es-CL')
-            for number in range(1, 11):
-                url = CRUPLAS_CATALOG if number == 1 else f'{CRUPLAS_CATALOG}?page={number}'
-                response = await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                if response and response.status >= 400:
-                    if number > 1 and response.status == 404:
-                        break
+            last_urls=set()
+            for number in range(1,15):
+                url = CRUPLAS_CATALOG if number==1 else f'{CRUPLAS_CATALOG}?page={number}'
+                response=await page.goto(url,wait_until='domcontentloaded',timeout=60000)
+                if response and response.status>=400:
+                    if number>1: break
                     raise RuntimeError(f'Cruplas HTTP {response.status}')
-                await page.locator('a[href*="/producto/"]').first.wait_for(timeout=20000)
-                cards = await page.locator('a[href*="/producto/"]').evaluate_all('''els => els.map(a => ({
-                    name: (a.querySelector('h2,h3,h4')?.innerText || '').trim(),
-                    url: a.href, text: (a.innerText || '').trim()
-                }))''')
-                before = len(found)
+                await page.locator('a[href*="/producto/"]').first.wait_for(state='attached',timeout=30000)
+                cards=await page.locator('a[href*="/producto/"]').evaluate_all("""els => els.map(a => {
+                    let node=a, chosen=a;
+                    for(let i=0;i<6&&node;i++,node=node.parentElement){
+                        const t=(node.innerText||'').trim();
+                        if(t.includes('$')&&t.length<900){chosen=node;break;}
+                    }
+                    return {url:a.href,text:(chosen.innerText||'').trim()};
+                })""")
+                urls={c['url'] for c in cards if c['url']}
+                if number>1 and urls==last_urls: break
+                last_urls=urls
                 for card in cards:
-                    if not card['url'] or 'cotización' in card['text'].lower() or 'agotado' in card['text'].lower():
-                        continue
-                    price = price_clp(card['text'])
-                    if not price or price <= 0:
-                        continue
-                    # Enlaces a veces incluyen imagen y texto, sin h3; recuperamos título desde la página.
-                    name = card['name'] or card['text'].split('SKU:')[0].split('SKU :')[0].strip()
-                    name = re.sub(r'^(Destacado|Bolsas de Basura Planas|Bolsas Transparentes)\s+', '', name, flags=re.I)
-                    if not name or len(name) > 180:
-                        continue
-                    found[card['url']] = dict(name=name, url=card['url'], price=price,
-                        vat_status='IVA excluido (Cruplas; precio neto por embalaje)')
-                if number > 1 and len(found) == before:
-                    break
+                    t=card['text']
+                    prices=re.findall(r'\$\s*[\d.]+(?:,\d{1,2})?',t)
+                    if not prices: continue
+                    price=price_clp(prices[0])
+                    if not price or price<=0: continue
+                    lines=[x.strip() for x in t.splitlines() if x.strip()]
+                    name=next((x for x in lines if any(k in x.lower() for k in ('bolsa ', 'film ', 'stretch ', 'masterbatch ')) and '$' not in x), '')
+                    if not name:
+                        name=next((x for x in lines if len(x)>9 and not any(k in x.lower() for k in ('sku:', 'disp.', 'iva', '$', 'destacado', 'bolsas transparentes'))), '')
+                    if not name or len(name)>180: continue
+                    found[card['url']]={'name':name,'url':card['url'],'price':price,
+                        'vat_status':'IVA excluido (Cruplas; neto por embalaje)'}
+                print(f'Cruplas: pagina {number}, {len(found)} productos acumulados',flush=True)
             if not found:
-                raise RuntimeError('Cruplas: no se detectaron productos con precio; revisar selectores')
+                raise RuntimeError('Cruplas: enlaces presentes, pero no se pudieron extraer precios y nombres')
             return list(found.values())
         finally:
             await browser.close()
