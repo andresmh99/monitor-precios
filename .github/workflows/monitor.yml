@@ -18,6 +18,18 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
       - run: python monitor.py
+	      - name: Verificar conexion configurada
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          url = os.getenv("DATABASE_URL", "").strip()
+          print("Secreto presente:", bool(url))
+          print("Formato PostgreSQL:", url.startswith(("postgresql://", "postgres://")))
+          if not url.startswith(("postgresql://", "postgres://")):
+              raise SystemExit("ERROR: DATABASE_URL no tiene formato PostgreSQL")
+          PY
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ALERT_THRESHOLD_PERCENT: '5'
