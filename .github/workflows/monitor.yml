@@ -1,35 +1,59 @@
+
 name: Monitor diario de precios
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '20 11 * * *'
+
 permissions:
   contents: read
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: python -m playwright install --with-deps chromium
-      - run: python monitor.py
-	      - name: Verificar conexion configurada
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Instalar navegador Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Verificar configuracion PostgreSQL
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python - <<'PY'
           import os
+
           url = os.getenv("DATABASE_URL", "").strip()
+
           print("Secreto presente:", bool(url))
-          print("Formato PostgreSQL:", url.startswith(("postgresql://", "postgres://")))
+          print(
+              "Formato PostgreSQL:",
+              url.startswith(("postgresql://", "postgres://"))
+          )
+
           if not url.startswith(("postgresql://", "postgres://")):
-              raise SystemExit("ERROR: DATABASE_URL no tiene formato PostgreSQL")
+              raise SystemExit(
+                  "ERROR: DATABASE_URL no tiene formato PostgreSQL"
+              )
+
+          print("Configuracion PostgreSQL valida")
           PY
+
+      - name: Ejecutar monitor de precios
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ALERT_THRESHOLD_PERCENT: '5'
@@ -39,3 +63,4 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python monitor.py
